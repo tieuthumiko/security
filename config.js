@@ -1,0 +1,13 @@
+module.exports = {
+  SPAM_LIMIT: 8,
+  SPAM_INTERVAL: 5000,
+  JOIN_LIMIT: 8,
+  JOIN_INTERVAL: 10000,
+  ACTION_LIMIT: 4,
+  ACTION_INTERVAL: 5000,
+  TIMEOUT_DURATION: 600000, // 10 phút
+  LOG_CHANNEL_NAME: "security-logs",
+  WHITELIST: [
+    "OWNER_ID_HERE"
+  ]
+};
