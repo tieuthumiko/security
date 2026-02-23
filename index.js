@@ -16,15 +16,14 @@ const client = new Client({
   ]
 });
 
-/* ================= CONFIG ================= */
+/* ================= CONFIG (1K MEMBER) ================= */
 
 const CONFIG = {
   RAID_THRESHOLD: 10,
   RAID_INTERVAL: 10000,
 
-  NUKE_CHANNEL_DELETE: 4,
-  NUKE_ROLE_CREATE: 4,
-  NUKE_BAN: 6,
+  NUKE_CHANNEL_DELETE: 3,
+  NUKE_BAN: 5,
 
   AUTO_UNLOCK_TIME: 5 * 60 * 1000
 };
@@ -35,7 +34,7 @@ const joinMap = new Map();
 const actionMap = new Map();
 const lockdownMap = new Map();
 
-/* ================= EXPRESS SERVER (Render) ================= */
+/* ================= EXPRESS (RENDER) ================= */
 
 const app = express();
 app.get('/', (req, res) => {
@@ -61,7 +60,22 @@ function isTrusted(member) {
   return false;
 }
 
-/* ================= LOG CHANNEL ================= */
+/* ================= LOG SYSTEM ================= */
+
+async function getSecurityCategory(guild) {
+  let category = guild.channels.cache.find(
+    c => c.name === '🛡 Security' && c.type === ChannelType.GuildCategory
+  );
+
+  if (!category) {
+    category = await guild.channels.create({
+      name: '🛡 Security',
+      type: ChannelType.GuildCategory
+    });
+  }
+
+  return category;
+}
 
 async function getLogChannel(guild) {
   let channel = guild.channels.cache.find(
@@ -70,13 +84,22 @@ async function getLogChannel(guild) {
 
   if (channel) return channel;
 
+  const category = await getSecurityCategory(guild);
+
   channel = await guild.channels.create({
     name: 'security-logs',
     type: ChannelType.GuildText,
+    parent: category.id,
     permissionOverwrites: [
       {
         id: guild.roles.everyone.id,
         deny: [PermissionFlagsBits.ViewChannel]
+      },
+      {
+        id: guild.roles.cache.find(r =>
+          r.permissions.has(PermissionFlagsBits.Administrator)
+        )?.id,
+        allow: [PermissionFlagsBits.ViewChannel]
       }
     ]
   });
@@ -124,7 +147,7 @@ async function unlock(guild) {
   log.send(`Server unlocked automatically.`);
 }
 
-/* ================= STRIP ROLES ================= */
+/* ================= STRIP DANGEROUS ROLES ================= */
 
 async function stripDangerousRoles(member) {
   const dangerous = member.roles.cache.filter(role =>
@@ -152,13 +175,13 @@ client.on('guildMemberAdd', async member => {
 
   joins.push(now);
 
-  const filtered = joins.filter(
+  const recent = joins.filter(
     time => now - time < CONFIG.RAID_INTERVAL
   );
 
-  joinMap.set(guild.id, filtered);
+  joinMap.set(guild.id, recent);
 
-  if (filtered.length >= CONFIG.RAID_THRESHOLD) {
+  if (recent.length >= CONFIG.RAID_THRESHOLD) {
     await lockdown(guild, 'Raid detected');
   }
 });
@@ -185,7 +208,10 @@ client.on('channelDelete', async channel => {
   const entry = audit.entries.first();
   if (!entry) return;
 
-  const member = await channel.guild.members.fetch(entry.executor.id).catch(() => null);
+  const member = await channel.guild.members
+    .fetch(entry.executor.id)
+    .catch(() => null);
+
   if (!member || isTrusted(member)) return;
 
   const count = await trackAction(channel.guild, member.id, 'delete');
@@ -202,7 +228,10 @@ client.on('guildBanAdd', async ban => {
   const entry = audit.entries.first();
   if (!entry) return;
 
-  const member = await ban.guild.members.fetch(entry.executor.id).catch(() => null);
+  const member = await ban.guild.members
+    .fetch(entry.executor.id)
+    .catch(() => null);
+
   if (!member || isTrusted(member)) return;
 
   const count = await trackAction(ban.guild, member.id, 'ban');
@@ -214,19 +243,30 @@ client.on('guildBanAdd', async ban => {
   }
 });
 
+/* ================= AUTO CREATE LOG ON JOIN ================= */
+
+client.on('guildCreate', async guild => {
+  await getLogChannel(guild);
+});
+
+/* ================= READY ================= */
+
+client.once('ready', async () => {
+  console.log(`Logged in as ${client.user.tag}`);
+
+  for (const guild of client.guilds.cache.values()) {
+    await getLogChannel(guild);
+  }
+});
+
 /* ================= STATUS UPDATE ================= */
 
 setInterval(() => {
+  if (!client.user) return;
   client.user.setActivity(
     `Protecting ${client.guilds.cache.size} servers`,
     { type: ActivityType.Watching }
   );
 }, 30000);
-
-/* ================= READY ================= */
-
-client.once('ready', () => {
-  console.log(`Logged in as ${client.user.tag}`);
-});
 
 client.login(process.env.TOKEN);
