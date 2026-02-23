@@ -1,14 +1,32 @@
 require('dotenv').config();
-const { ActivityType } = require('discord.js');
 const express = require('express');
 const {
   Client,
   GatewayIntentBits,
   AuditLogEvent,
+  ActivityType,
   PermissionsBitField
 } = require('discord.js');
 
-const config = require('./config');
+/* ================= CONFIG ================= */
+
+const SPAM_LIMIT = 8;
+const SPAM_INTERVAL = 5000;
+
+const JOIN_LIMIT = 8;
+const JOIN_INTERVAL = 10000;
+
+const ACTION_LIMIT = 4;
+const ACTION_INTERVAL = 5000;
+
+const TIMEOUT_DURATION = 10 * 60 * 1000;
+
+const WHITELIST_USERS = ["OWNER_ID"];
+const WHITELIST_ROLES = ["ROLE_ID_1", "ROLE_ID_2"];
+
+const LOG_CHANNEL_NAME = "security-logs";
+
+/* ================= CLIENT ================= */
 
 const client = new Client({
   intents: [
@@ -20,111 +38,110 @@ const client = new Client({
   ]
 });
 
-/* ================= EXPRESS (Render Keep Alive) ================= */
+/* ================= RENDER KEEP ALIVE ================= */
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.get('/', (req, res) => {
-  res.status(200).send('Security Bot Online');
-});
+app.get('/', (_, res) => res.send("Bot Alive"));
+app.listen(PORT, () => console.log(`Web server on ${PORT}`));
 
-app.listen(PORT, () => {
-  console.log(`Web server running on ${PORT}`);
-});
-
-/* ================= TRACKERS ================= */
+/* ================= MEMORY TRACKERS ================= */
 
 const spamTracker = new Map();
 const joinTracker = new Map();
 const actionTracker = new Map();
 
-/* ================= HELPERS ================= */
+/* ================= UTIL ================= */
 
-function getLogChannel(guild) {
-  return guild.channels.cache.find(
-    c => c.name === config.LOG_CHANNEL_NAME
-  );
+function log(guild, msg) {
+  const ch = guild.channels.cache.find(c => c.name === LOG_CHANNEL_NAME);
+  if (ch) ch.send(msg).catch(() => {});
 }
 
 function isWhitelisted(member) {
-  if (!member) return false;
-
-  if (config.WHITELIST_USERS.includes(member.id)) return true;
-
-  return member.roles.cache.some(role =>
-    config.WHITELIST_ROLES.includes(role.id)
-  );
+  if (!member) return true;
+  if (WHITELIST_USERS.includes(member.id)) return true;
+  return member.roles.cache.some(r => WHITELIST_ROLES.includes(r.id));
 }
 
-async function punish(member, reason, guild) {
+async function safeTimeout(member, reason) {
+  if (!member.moderatable) return;
   try {
-    if (!member.moderatable) return;
+    await member.timeout(TIMEOUT_DURATION, reason);
+  } catch {}
+}
 
-    await member.timeout(config.TIMEOUT_DURATION, reason);
+/* ================= STATUS SYSTEM ================= */
 
-    getLogChannel(guild)?.send(
-      `🚨 Punished <@${member.id}> | ${reason}`
-    );
-  } catch (err) {
-    console.log("Punish error:", err.message);
-  }
+let lastServerCount = 0;
+
+function updateStatus(force = false) {
+  const count = client.guilds.cache.size;
+
+  if (!force && count === lastServerCount) return;
+
+  lastServerCount = count;
+
+  client.user.setPresence({
+    activities: [{
+      name: `${count} servers secured`,
+      type: ActivityType.Watching
+    }],
+    status: "online"
+  }).catch(() => {});
 }
 
 /* ================= READY ================= */
 
-client.user.setPresence({
-  activities: [{
-    name: `${client.guilds.cache.size} servers`,
-    type: ActivityType.Watching
-  }],
-  status: "online"
+client.once('ready', () => {
+  console.log(`🛡 Logged in as ${client.user.tag}`);
+
+  updateStatus(true);
+  setInterval(updateStatus, 30000);
 });
 
 /* ================= ANTI SPAM ================= */
 
-client.on('messageCreate', async message => {
+client.on('messageCreate', async (message) => {
   if (!message.guild || message.author.bot) return;
 
   const member = message.member;
   if (!member || isWhitelisted(member)) return;
 
   const now = Date.now();
-  const userId = member.id;
+  const id = member.id;
 
-  if (!spamTracker.has(userId)) spamTracker.set(userId, []);
-  spamTracker.get(userId).push(now);
+  if (!spamTracker.has(id)) spamTracker.set(id, []);
+  spamTracker.get(id).push(now);
 
-  const recent = spamTracker.get(userId)
-    .filter(t => now - t < config.SPAM_INTERVAL);
+  const recent = spamTracker.get(id)
+    .filter(t => now - t < SPAM_INTERVAL);
 
-  spamTracker.set(userId, recent);
+  spamTracker.set(id, recent);
 
-  if (recent.length >= config.SPAM_LIMIT) {
-    await punish(member, "Spam detected", message.guild);
-  }
-
-  if (message.mentions.everyone) {
-    await punish(member, "Mass mention detected", message.guild);
+  if (recent.length >= SPAM_LIMIT || message.mentions.everyone) {
+    await safeTimeout(member, "Spam detected");
+    log(message.guild, `Spam: <@${id}>`);
   }
 });
 
 /* ================= ANTI MASS JOIN ================= */
 
 client.on('guildMemberAdd', member => {
-  const guildId = member.guild.id;
+  const gid = member.guild.id;
   const now = Date.now();
 
-  if (!joinTracker.has(guildId)) joinTracker.set(guildId, []);
-  joinTracker.get(guildId).push(now);
+  if (!joinTracker.has(gid)) joinTracker.set(gid, []);
+  joinTracker.get(gid).push(now);
 
-  const recent = joinTracker.get(guildId)
-    .filter(t => now - t < config.JOIN_INTERVAL);
+  const recent = joinTracker.get(gid)
+    .filter(t => now - t < JOIN_INTERVAL);
 
-  joinTracker.set(guildId, recent);
+  joinTracker.set(gid, recent);
 
-  if (recent.length >= config.JOIN_LIMIT) {
-    getLogChannel(member.guild)?.send("Mass join detected!");
+  if (recent.length >= JOIN_LIMIT) {
+    log(member.guild, "Mass join detected");
   }
 });
 
@@ -132,11 +149,7 @@ client.on('guildMemberAdd', member => {
 
 async function checkAudit(guild, type) {
   try {
-    const logs = await guild.fetchAuditLogs({
-      limit: 1,
-      type
-    });
-
+    const logs = await guild.fetchAuditLogs({ limit: 1, type });
     const entry = logs.entries.first();
     if (!entry) return;
 
@@ -144,8 +157,7 @@ async function checkAudit(guild, type) {
     if (!executor) return;
 
     const member = await guild.members.fetch(executor.id).catch(() => null);
-    if (!member) return;
-    if (isWhitelisted(member)) return;
+    if (!member || isWhitelisted(member)) return;
 
     const now = Date.now();
 
@@ -155,40 +167,31 @@ async function checkAudit(guild, type) {
     actionTracker.get(member.id).push(now);
 
     const recent = actionTracker.get(member.id)
-      .filter(t => now - t < config.ACTION_INTERVAL);
+      .filter(t => now - t < ACTION_INTERVAL);
 
     actionTracker.set(member.id, recent);
 
-    if (recent.length >= config.ACTION_LIMIT) {
-      await punish(member, "Anti-nuke triggered", guild);
+    if (recent.length >= ACTION_LIMIT) {
+      await safeTimeout(member, "Anti-nuke triggered");
+      log(guild, `Anti-Nuke: <@${member.id}>`);
     }
 
-  } catch (err) {
-    console.log("Audit error:", err.message);
-  }
+  } catch {}
 }
 
-client.on('channelDelete', channel => {
-  checkAudit(channel.guild, AuditLogEvent.ChannelDelete);
-});
+client.on('channelDelete', c => checkAudit(c.guild, AuditLogEvent.ChannelDelete));
+client.on('roleDelete', r => checkAudit(r.guild, AuditLogEvent.RoleDelete));
+client.on('guildBanAdd', b => checkAudit(b.guild, AuditLogEvent.MemberBanAdd));
 
-client.on('roleDelete', role => {
-  checkAudit(role.guild, AuditLogEvent.RoleDelete);
-});
+/* ================= UPDATE STATUS ON JOIN/LEAVE ================= */
 
-client.on('guildBanAdd', ban => {
-  checkAudit(ban.guild, AuditLogEvent.MemberBanAdd);
-});
+client.on('guildCreate', () => updateStatus(true));
+client.on('guildDelete', () => updateStatus(true));
 
-/* ================= ERROR HANDLING ================= */
+/* ================= GLOBAL ERROR HANDLER ================= */
 
-process.on('unhandledRejection', err => {
-  console.log("Unhandled promise rejection:", err);
-});
-
-process.on('uncaughtException', err => {
-  console.log("Uncaught exception:", err);
-});
+process.on('unhandledRejection', () => {});
+process.on('uncaughtException', () => {});
 
 /* ================= LOGIN ================= */
 
