@@ -19,32 +19,26 @@ const client = new Client({
   ]
 });
 
-// ================= EXPRESS FOR RENDER =================
+/* ================= EXPRESS (Render Keep Alive) ================= */
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.get('/', (req, res) => {
-  res.send('Security Bot Running');
+  res.status(200).send('Security Bot Online');
 });
 
 app.listen(PORT, () => {
   console.log(`Web server running on ${PORT}`);
 });
 
-// ================= TRACKERS =================
+/* ================= TRACKERS ================= */
 
 const spamTracker = new Map();
 const joinTracker = new Map();
 const actionTracker = new Map();
 
-// ================= READY =================
-
-client.once('ready', () => {
-  console.log(`🛡 Logged in as ${client.user.tag}`);
-});
-
-// ================= HELPER =================
+/* ================= HELPERS ================= */
 
 function getLogChannel(guild) {
   return guild.channels.cache.find(
@@ -52,17 +46,46 @@ function getLogChannel(guild) {
   );
 }
 
-function isWhitelisted(id) {
-  return config.WHITELIST.includes(id);
+function isWhitelisted(member) {
+  if (!member) return false;
+
+  if (config.WHITELIST_USERS.includes(member.id)) return true;
+
+  return member.roles.cache.some(role =>
+    config.WHITELIST_ROLES.includes(role.id)
+  );
 }
 
-// ================= ANTI SPAM =================
+async function punish(member, reason, guild) {
+  try {
+    if (!member.moderatable) return;
+
+    await member.timeout(config.TIMEOUT_DURATION, reason);
+
+    getLogChannel(guild)?.send(
+      `🚨 Punished <@${member.id}> | ${reason}`
+    );
+  } catch (err) {
+    console.log("Punish error:", err.message);
+  }
+}
+
+/* ================= READY ================= */
+
+client.once('ready', () => {
+  console.log(`🛡 Logged in as ${client.user.tag}`);
+});
+
+/* ================= ANTI SPAM ================= */
 
 client.on('messageCreate', async message => {
   if (!message.guild || message.author.bot) return;
 
-  const userId = message.author.id;
+  const member = message.member;
+  if (!member || isWhitelisted(member)) return;
+
   const now = Date.now();
+  const userId = member.id;
 
   if (!spamTracker.has(userId)) spamTracker.set(userId, []);
   spamTracker.get(userId).push(now);
@@ -73,25 +96,15 @@ client.on('messageCreate', async message => {
   spamTracker.set(userId, recent);
 
   if (recent.length >= config.SPAM_LIMIT) {
-    await message.member.timeout(
-      config.TIMEOUT_DURATION,
-      "Spam detected"
-    );
-
-    getLogChannel(message.guild)?.send(
-      `⚠ Spam detected from <@${userId}>`
-    );
+    await punish(member, "Spam detected", message.guild);
   }
 
   if (message.mentions.everyone) {
-    await message.member.timeout(
-      config.TIMEOUT_DURATION,
-      "Mass mention"
-    );
+    await punish(member, "Mass mention detected", message.guild);
   }
 });
 
-// ================= ANTI MASS JOIN =================
+/* ================= ANTI MASS JOIN ================= */
 
 client.on('guildMemberAdd', member => {
   const guildId = member.guild.id;
@@ -106,59 +119,47 @@ client.on('guildMemberAdd', member => {
   joinTracker.set(guildId, recent);
 
   if (recent.length >= config.JOIN_LIMIT) {
-    getLogChannel(member.guild)?.send(
-      "🚨 Mass join detected!"
-    );
+    getLogChannel(member.guild)?.send("Mass join detected!");
   }
 });
 
-// ================= ANTI NUKE =================
+/* ================= ANTI NUKE ================= */
 
 async function checkAudit(guild, type) {
-  const logs = await guild.fetchAuditLogs({
-    limit: 1,
-    type
-  });
+  try {
+    const logs = await guild.fetchAuditLogs({
+      limit: 1,
+      type
+    });
 
-  const entry = logs.entries.first();
-  if (!entry) return;
+    const entry = logs.entries.first();
+    if (!entry) return;
 
-  const executor = entry.executor;
-  if (!executor) return;
-  if (isWhitelisted(executor.id)) return;
+    const executor = entry.executor;
+    if (!executor) return;
 
-  const now = Date.now();
-
-  if (!actionTracker.has(executor.id))
-    actionTracker.set(executor.id, []);
-
-  actionTracker.get(executor.id).push(now);
-
-  const recent = actionTracker.get(executor.id)
-    .filter(t => now - t < config.ACTION_INTERVAL);
-
-  actionTracker.set(executor.id, recent);
-
-  if (recent.length >= config.ACTION_LIMIT) {
-    const member = await guild.members.fetch(executor.id);
-
+    const member = await guild.members.fetch(executor.id).catch(() => null);
     if (!member) return;
+    if (isWhitelisted(member)) return;
 
-    if (
-      member.permissions.has(
-        PermissionsBitField.Flags.Administrator
-      )
-    ) {
-      await member.roles.set([]);
-      await member.timeout(
-        config.TIMEOUT_DURATION,
-        "Anti-nuke triggered"
-      );
+    const now = Date.now();
 
-      getLogChannel(guild)?.send(
-        `🚨 Anti-nuke activated on <@${executor.id}>`
-      );
+    if (!actionTracker.has(member.id))
+      actionTracker.set(member.id, []);
+
+    actionTracker.get(member.id).push(now);
+
+    const recent = actionTracker.get(member.id)
+      .filter(t => now - t < config.ACTION_INTERVAL);
+
+    actionTracker.set(member.id, recent);
+
+    if (recent.length >= config.ACTION_LIMIT) {
+      await punish(member, "Anti-nuke triggered", guild);
     }
+
+  } catch (err) {
+    console.log("Audit error:", err.message);
   }
 }
 
@@ -174,6 +175,16 @@ client.on('guildBanAdd', ban => {
   checkAudit(ban.guild, AuditLogEvent.MemberBanAdd);
 });
 
-// ================= LOGIN =================
+/* ================= ERROR HANDLING ================= */
+
+process.on('unhandledRejection', err => {
+  console.log("Unhandled promise rejection:", err);
+});
+
+process.on('uncaughtException', err => {
+  console.log("Uncaught exception:", err);
+});
+
+/* ================= LOGIN ================= */
 
 client.login(process.env.DISCORD_TOKEN);
