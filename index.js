@@ -1,4 +1,5 @@
 require('dotenv').config();
+const { ActivityType } = require('discord.js');
 const express = require('express');
 const {
   Client,
@@ -72,8 +73,12 @@ async function punish(member, reason, guild) {
 
 /* ================= READY ================= */
 
-client.once('ready', () => {
-  console.log(`🛡 Logged in as ${client.user.tag}`);
+client.user.setPresence({
+  activities: [{
+    name: `${client.guilds.cache.size} servers`,
+    type: ActivityType.Watching
+  }],
+  status: "online"
 });
 
 /* ================= ANTI SPAM ================= */
