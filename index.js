@@ -2,17 +2,21 @@ require('dotenv').config();
 const express = require('express');
 const mongoose = require("mongoose");
 
-async function connectDB() {
+async function startBot() {
   try {
     await mongoose.connect(process.env.MONGO_URI);
-    console.log("MongoDB Connected");
+    console.log("✅ MongoDB Connected");
+
+    await client.login(process.env.TOKEN);
+    console.log("✅ Discord Bot Logged In");
+
   } catch (err) {
-    console.error("MongoDB Failed:", err);
+    console.error("Startup Error:", err);
     process.exit(1);
   }
 }
 
-connectDB();
+startBot();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
