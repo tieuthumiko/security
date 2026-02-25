@@ -6,13 +6,15 @@ async function startBot() {
   try {
     await mongoose.connect(process.env.MONGO_URI);
     console.log("✅ MongoDB Connected");
-
-    await client.login(process.env.TOKEN);
-    console.log("✅ Discord Bot Logged In");
-
   } catch (err) {
-    console.error("Startup Error:", err);
-    process.exit(1);
+    console.error("MongoDB Failed:", err);
+  }
+
+  try {
+    await client.login(process.env.TOKEN);
+    console.log("✅ Discord Logged In");
+  } catch (err) {
+    console.error("Discord Login Failed:", err);
   }
 }
 
