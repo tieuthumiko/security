@@ -1,51 +1,10 @@
 require('dotenv').config();
 const express = require('express');
-const mongoose = require("mongoose");
-
-async function startBot() {
-  try {
-    await mongoose.connect(process.env.MONGO_URI);
-    console.log("✅ MongoDB Connected");
-  } catch (err) {
-    console.error("MongoDB Failed:", err);
-  }
-
-  try {
-    await client.login(process.env.TOKEN);
-    console.log("✅ Discord Logged In");
-  } catch (err) {
-    console.error("Discord Login Failed:", err);
-  }
-}
-
-startBot();
-
 const app = express();
-const PORT = process.env.PORT || 3000;
 
+const PORT = process.env.PORT || 3000;
 app.get('/', (req, res) => res.send('Bot is running.'));
 app.listen(PORT, () => console.log(`Web server running on ${PORT}`));
-
-/* =========================
-   MONGODB CONNECT
-========================= */
-
-mongoose.connect(process.env.MONGO_URI)
-  .then(() => console.log('MongoDB Connected'))
-  .catch(err => console.log(err));
-
-const guildSchema = new mongoose.Schema({
-  guildId: String,
-  trustedUsers: [String],
-  lockedChannels: [String],
-  lockdown: Boolean
-});
-
-const GuildModel = mongoose.model('Guild', guildSchema);
-
-/* =========================
-   DISCORD SETUP
-========================= */
 
 const {
   Client,
@@ -72,36 +31,24 @@ const client = new Client({
 const TOKEN = process.env.TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 
-/* =========================
-   UTIL
-========================= */
+/* =======================
+   MEMORY (PER GUILD)
+======================= */
 
-async function getGuildData(guildId) {
-  let data = await GuildModel.findOne({ guildId });
-  if (!data) {
-    data = await GuildModel.create({
-      guildId,
-      trustedUsers: [],
-      lockedChannels: [],
-      lockdown: false
-    });
-  }
-  return data;
-}
+const trustedUsers = new Map(); // guildId => Set
+const joinMap = new Map();
+const messageMap = new Map();
+const lockdownState = new Map();
 
-function isAdmin(member) {
-  return member.permissions.has(PermissionsBitField.Flags.Administrator);
-}
-
-/* =========================
+/* =======================
    SLASH COMMANDS
-========================= */
+======================= */
 
 const commands = [
   new SlashCommandBuilder().setName('help').setDescription('Show help'),
   new SlashCommandBuilder().setName('lockdown').setDescription('Lock server'),
   new SlashCommandBuilder().setName('unlock').setDescription('Unlock server'),
-  new SlashCommandBuilder().setName('status').setDescription('Security status'),
+  new SlashCommandBuilder().setName('status').setDescription('Check status'),
   new SlashCommandBuilder()
     .setName('trust')
     .setDescription('Trust user')
@@ -112,9 +59,9 @@ const commands = [
     .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
 ].map(c => c.toJSON());
 
-/* =========================
+/* =======================
    READY
-========================= */
+======================= */
 
 client.once('ready', async () => {
   console.log(`Logged in as ${client.user.tag}`);
@@ -130,13 +77,12 @@ client.once('ready', async () => {
   client.guilds.cache.forEach(setupLogs);
 });
 
-/* =========================
-   AUTO LOG SETUP
-========================= */
+/* =======================
+   AUTO SETUP LOG
+======================= */
 
 client.on('guildCreate', async guild => {
   await setupLogs(guild);
-  await getGuildData(guild.id);
 });
 
 async function setupLogs(guild) {
@@ -167,72 +113,86 @@ async function setupLogs(guild) {
         ]
       });
     }
-  } catch {}
+  } catch (e) {}
 }
 
 function getLog(guild) {
   return guild.channels.cache.find(c => c.name === 'security-logs');
 }
 
-/* =========================
-   LOCKDOWN SYSTEM
-========================= */
+function isTrusted(member) {
+  if (!trustedUsers.has(member.guild.id))
+    trustedUsers.set(member.guild.id, new Set());
 
-async function lockdownServer(guild) {
-  const data = await getGuildData(guild.id);
-
-  guild.channels.cache.forEach(async channel => {
-    if (channel.type === ChannelType.GuildText) {
-      await channel.permissionOverwrites.edit(
-        guild.roles.everyone,
-        { SendMessages: false }
-      ).catch(() => {});
-
-      if (!data.lockedChannels.includes(channel.id))
-        data.lockedChannels.push(channel.id);
-    }
-  });
-
-  data.lockdown = true;
-  await data.save();
+  return member.permissions.has(PermissionsBitField.Flags.Administrator)
+    || trustedUsers.get(member.guild.id).has(member.id);
 }
 
-async function unlockServer(guild) {
-  const data = await getGuildData(guild.id);
+/* =======================
+   JOIN RAID
+======================= */
 
-  guild.channels.cache.forEach(async channel => {
-    if (channel.type === ChannelType.GuildText) {
-      await channel.permissionOverwrites.edit(
-        guild.roles.everyone,
-        { SendMessages: null }
-      ).catch(() => {});
-    }
-  });
+client.on('guildMemberAdd', async member => {
+  const guild = member.guild;
+  const now = Date.now();
 
-  data.lockdown = false;
-  await data.save();
-}
+  if (!joinMap.has(guild.id)) joinMap.set(guild.id, []);
+  joinMap.get(guild.id).push(now);
 
-/* =========================
-   AUTO LOCK IF PREVIOUSLY LOCKED
-========================= */
+  const recent = joinMap.get(guild.id).filter(t => now - t < 10000);
 
-client.on('channelCreate', async channel => {
-  if (!channel.guild) return;
+  if (recent.length >= 5 && !lockdownState.get(guild.id)) {
+    lockdownState.set(guild.id, true);
+    await lockdownServer(guild);
 
-  const data = await getGuildData(channel.guild.id);
+    const log = getLog(guild);
+    if (log) log.send('Mass join detected. Server locked.');
 
-  if (data.lockedChannels.includes(channel.id)) {
-    await channel.permissionOverwrites.edit(
-      channel.guild.roles.everyone,
-      { SendMessages: false }
-    ).catch(() => {});
+    setTimeout(async () => {
+      await unlockServer(guild);
+      if (log) log.send('Auto unlock after 5 minutes.');
+    }, 5 * 60 * 1000);
+  }
+
+  joinMap.set(guild.id, recent);
+});
+
+/* =======================
+   MESSAGE PROTECTION
+======================= */
+
+client.on('messageCreate', async message => {
+  if (!message.guild || message.author.bot) return;
+  if (isTrusted(message.member)) return;
+
+  const now = Date.now();
+  if (!messageMap.has(message.author.id))
+    messageMap.set(message.author.id, []);
+
+  messageMap.get(message.author.id).push(now);
+  const recent = messageMap.get(message.author.id)
+    .filter(t => now - t < 5000);
+
+  if (recent.length >= 6) {
+    await message.delete().catch(() => {});
+    await message.member.timeout(600000).catch(() => {});
+  }
+
+  messageMap.set(message.author.id, recent);
+
+  if (message.mentions.everyone || message.mentions.users.size >= 5) {
+    await message.delete().catch(() => {});
+    await message.member.timeout(600000).catch(() => {});
+  }
+
+  if (/discord\.gg|discord\.com\/invite/.test(message.content)) {
+    await message.delete().catch(() => {});
   }
 });
 
-/* =========================
-   ANTI NUKE (CHANNEL DELETE)
-========================= */
+/* =======================
+   ANTI NUKE
+======================= */
 
 client.on('channelDelete', async channel => {
   const logs = await channel.guild.fetchAuditLogs({
@@ -243,49 +203,72 @@ client.on('channelDelete', async channel => {
   const entry = logs.entries.first();
   if (!entry) return;
 
-  const executor = await channel.guild.members.fetch(entry.executor.id).catch(() => {});
-  if (!executor) return;
+  const executor = entry.executor;
+  const member = await channel.guild.members.fetch(executor.id).catch(() => {});
+  if (!member || isTrusted(member)) return;
 
-  const data = await getGuildData(channel.guild.id);
-
-  if (!isAdmin(executor) && !data.trustedUsers.includes(executor.id)) {
-    await executor.ban({ reason: 'Anti Nuke' }).catch(() => {});
-    const log = getLog(channel.guild);
-    if (log) log.send(`${executor.user.tag} banned (Channel Delete).`);
-  }
+  await member.ban({ reason: 'Anti Nuke: Channel Delete' }).catch(() => {});
+  const log = getLog(channel.guild);
+  if (log) log.send(`${executor.tag} banned (channel delete).`);
 });
 
-/* =========================
+/* =======================
+   LOCKDOWN
+======================= */
+
+async function lockdownServer(guild) {
+  guild.channels.cache.forEach(async channel => {
+    if (channel.type === ChannelType.GuildText) {
+      await channel.permissionOverwrites.edit(
+        guild.roles.everyone,
+        { SendMessages: false }
+      ).catch(() => {});
+    }
+  });
+}
+
+async function unlockServer(guild) {
+  guild.channels.cache.forEach(async channel => {
+    if (channel.type === ChannelType.GuildText) {
+      await channel.permissionOverwrites.edit(
+        guild.roles.everyone,
+        { SendMessages: null }
+      ).catch(() => {});
+    }
+  });
+  lockdownState.set(guild.id, false);
+}
+
+/* =======================
    SLASH HANDLER
-========================= */
+======================= */
 
 client.on('interactionCreate', async interaction => {
   if (!interaction.isChatInputCommand()) return;
-
   const guild = interaction.guild;
-  const data = await getGuildData(guild.id);
 
   if (interaction.commandName === 'help') {
     const embed = new EmbedBuilder()
       .setTitle('🛡 Security Bot')
       .setColor('Red')
-      .setDescription('w miko')
+      .setDescription('lel')
       .addFields(
         { name: '/lockdown', value: 'Lock server' },
         { name: '/unlock', value: 'Unlock server' },
-        { name: '/status', value: 'Security status' },
+        { name: '/status', value: 'Check status' },
         { name: '/trust', value: 'Trust user' },
-        { name: '/untrust', value: 'Remove trusted user' }
+        { name: '/untrust', value: 'Remove trust' }
       );
 
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
 
-  if (!isAdmin(interaction.member))
+  if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator))
     return interaction.reply({ content: 'Admin only.', ephemeral: true });
 
   if (interaction.commandName === 'lockdown') {
     await lockdownServer(guild);
+    lockdownState.set(guild.id, true);
     return interaction.reply('Server locked.');
   }
 
@@ -296,27 +279,24 @@ client.on('interactionCreate', async interaction => {
 
   if (interaction.commandName === 'status') {
     return interaction.reply(
-      `Lockdown: ${data.lockdown ? 'ON' : 'OFF'}`
+      `Lockdown: ${lockdownState.get(guild.id) ? 'ON' : 'OFF'}`
     );
   }
 
   if (interaction.commandName === 'trust') {
     const user = interaction.options.getUser('user');
-    if (!data.trustedUsers.includes(user.id))
-      data.trustedUsers.push(user.id);
-    await data.save();
+    if (!trustedUsers.has(guild.id))
+      trustedUsers.set(guild.id, new Set());
+    trustedUsers.get(guild.id).add(user.id);
     return interaction.reply(`${user.tag} trusted.`);
   }
 
   if (interaction.commandName === 'untrust') {
     const user = interaction.options.getUser('user');
-    data.trustedUsers = data.trustedUsers.filter(id => id !== user.id);
-    await data.save();
+    trustedUsers.get(guild.id)?.delete(user.id);
     return interaction.reply(`${user.tag} removed.`);
   }
 });
-
-/* ========================= */
 
 process.on('unhandledRejection', console.error);
 process.on('uncaughtException', console.error);
