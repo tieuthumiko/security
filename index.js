@@ -1,11 +1,6 @@
 require('dotenv').config();
 const express = require('express');
-const app = express();
-
-const PORT = process.env.PORT || 3000;
-app.get('/', (req, res) => res.send('Bot is running.'));
-app.listen(PORT, () => console.log(`Web server running on ${PORT}`));
-
+const mongoose = require('mongoose');
 const {
   Client,
   GatewayIntentBits,
@@ -19,6 +14,39 @@ const {
   AuditLogEvent
 } = require('discord.js');
 
+const app = express();
+const PORT = process.env.PORT || 3000;
+app.get('/', (req, res) => res.send('Bot is running.'));
+app.listen(PORT, () => console.log(`Web running on ${PORT}`));
+
+mongoose.set('bufferCommands', false);
+
+mongoose.connect(process.env.MONGO_URI, {
+  serverSelectionTimeoutMS: 5000
+})
+.then(() => console.log('MongoDB Connected'))
+.catch(err => console.error('MongoDB Error:', err));
+
+mongoose.connection.on('disconnected', () => {
+  console.log('⚠ MongoDB Disconnected');
+});
+
+const guildSchema = new mongoose.Schema({
+  guildId: { type: String, unique: true },
+  trustedUsers: { type: [String], default: [] },
+  lockdown: { type: Boolean, default: false },
+  lockdownBackup: {
+    type: Map,
+    of: {
+      allow: [String],
+      deny: [String]
+    },
+    default: {}
+  }
+});
+
+const Guild = mongoose.model('Guild', guildSchema);
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -31,18 +59,49 @@ const client = new Client({
 const TOKEN = process.env.TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 
-/* =======================
-   MEMORY (PER GUILD)
-======================= */
+const guildCache = new Map();
 
-const trustedUsers = new Map(); // guildId => Set
+async function getGuildData(guildId) {
+  const cached = guildCache.get(guildId);
+  if (cached && Date.now() - cached.timestamp < 30000)
+    return cached.data;
+
+  let data = await Guild.findOne({ guildId });
+  if (!data) data = await Guild.create({ guildId });
+
+  guildCache.set(guildId, { data, timestamp: Date.now() });
+  return data;
+}
+
+async function isTrusted(member) {
+  if (member.permissions.has(PermissionsBitField.Flags.Administrator))
+    return true;
+
+  try {
+    const data = await getGuildData(member.guild.id);
+    return data.trustedUsers.includes(member.id);
+  } catch {
+    return false;
+  }
+}
+
 const joinMap = new Map();
 const messageMap = new Map();
-const lockdownState = new Map();
 
-/* =======================
-   SLASH COMMANDS
-======================= */
+client.once('ready', async () => {
+  console.log(`Logged in as ${client.user.tag}`);
+
+  client.user.setPresence({
+    activities: [{ name: '/help', type: ActivityType.Watching }],
+    status: 'online'
+  });
+
+  const rest = new REST({ version: '10' }).setToken(TOKEN);
+  await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
+
+  client.guilds.cache.forEach(setupLogs);
+});
+
 
 const commands = [
   new SlashCommandBuilder().setName('help').setDescription('Show help'),
@@ -59,28 +118,6 @@ const commands = [
     .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
 ].map(c => c.toJSON());
 
-/* =======================
-   READY
-======================= */
-
-client.once('ready', async () => {
-  console.log(`Logged in as ${client.user.tag}`);
-
-  client.user.setPresence({
-    activities: [{ name: '/help', type: ActivityType.Watching }],
-    status: 'online'
-  });
-
-  const rest = new REST({ version: '10' }).setToken(TOKEN);
-  await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
-
-  client.guilds.cache.forEach(setupLogs);
-});
-
-/* =======================
-   AUTO SETUP LOG
-======================= */
-
 client.on('guildCreate', async guild => {
   await setupLogs(guild);
 });
@@ -94,10 +131,7 @@ async function setupLogs(guild) {
     if (!category) {
       category = await guild.channels.create({
         name: '🛡 Security',
-        type: ChannelType.GuildCategory,
-        permissionOverwrites: [
-          { id: guild.roles.everyone.id, deny: [PermissionsBitField.Flags.ViewChannel] }
-        ]
+        type: ChannelType.GuildCategory
       });
     }
 
@@ -107,30 +141,15 @@ async function setupLogs(guild) {
       await guild.channels.create({
         name: 'security-logs',
         type: ChannelType.GuildText,
-        parent: category.id,
-        permissionOverwrites: [
-          { id: guild.roles.everyone.id, deny: [PermissionsBitField.Flags.ViewChannel] }
-        ]
+        parent: category.id
       });
     }
-  } catch (e) {}
+  } catch {}
 }
 
 function getLog(guild) {
   return guild.channels.cache.find(c => c.name === 'security-logs');
 }
-
-function isTrusted(member) {
-  if (!trustedUsers.has(member.guild.id))
-    trustedUsers.set(member.guild.id, new Set());
-
-  return member.permissions.has(PermissionsBitField.Flags.Administrator)
-    || trustedUsers.get(member.guild.id).has(member.id);
-}
-
-/* =======================
-   JOIN RAID
-======================= */
 
 client.on('guildMemberAdd', async member => {
   const guild = member.guild;
@@ -141,29 +160,31 @@ client.on('guildMemberAdd', async member => {
 
   const recent = joinMap.get(guild.id).filter(t => now - t < 10000);
 
-  if (recent.length >= 5 && !lockdownState.get(guild.id)) {
-    lockdownState.set(guild.id, true);
-    await lockdownServer(guild);
+  if (recent.length >= 5) {
+    const data = await getGuildData(guild.id);
+    if (!data.lockdown) {
+      data.lockdown = true;
+      await data.save();
 
-    const log = getLog(guild);
-    if (log) log.send('Mass join detected. Server locked.');
+      await lockdownServer(guild);
+      const log = getLog(guild);
+      if (log) log.send('Mass join detected. Server locked.');
 
-    setTimeout(async () => {
-      await unlockServer(guild);
-      if (log) log.send('Auto unlock after 5 minutes.');
-    }, 5 * 60 * 1000);
+      setTimeout(async () => {
+        data.lockdown = false;
+        await data.save();
+        await unlockServer(guild);
+        if (log) log.send('Auto unlock.');
+      }, 5 * 60 * 1000);
+    }
   }
 
   joinMap.set(guild.id, recent);
 });
 
-/* =======================
-   MESSAGE PROTECTION
-======================= */
-
 client.on('messageCreate', async message => {
   if (!message.guild || message.author.bot) return;
-  if (isTrusted(message.member)) return;
+  if (await isTrusted(message.member)) return;
 
   const now = Date.now();
   if (!messageMap.has(message.author.id))
@@ -190,10 +211,6 @@ client.on('messageCreate', async message => {
   }
 });
 
-/* =======================
-   ANTI NUKE
-======================= */
-
 client.on('channelDelete', async channel => {
   const logs = await channel.guild.fetchAuditLogs({
     type: AuditLogEvent.ChannelDelete,
@@ -205,95 +222,120 @@ client.on('channelDelete', async channel => {
 
   const executor = entry.executor;
   const member = await channel.guild.members.fetch(executor.id).catch(() => {});
-  if (!member || isTrusted(member)) return;
+  if (!member || await isTrusted(member)) return;
 
   await member.ban({ reason: 'Anti Nuke: Channel Delete' }).catch(() => {});
   const log = getLog(channel.guild);
   if (log) log.send(`${executor.tag} banned (channel delete).`);
 });
 
-/* =======================
-   LOCKDOWN
-======================= */
-
 async function lockdownServer(guild) {
-  guild.channels.cache.forEach(async channel => {
-    if (channel.type === ChannelType.GuildText) {
-      await channel.permissionOverwrites.edit(
-        guild.roles.everyone,
-        { SendMessages: false }
-      ).catch(() => {});
+  const data = await getGuildData(guild.id);
+  if (data.lockdown) return;
+
+  data.lockdownBackup.clear();
+
+  for (const channel of guild.channels.cache.values()) {
+    if (channel.type !== ChannelType.GuildText) continue;
+
+    const overwrite = channel.permissionOverwrites.cache.get(
+      guild.roles.everyone.id
+    );
+
+    if (overwrite) {
+      data.lockdownBackup.set(channel.id, {
+        allow: overwrite.allow.toArray(),
+        deny: overwrite.deny.toArray()
+      });
+    } else {
+      data.lockdownBackup.set(channel.id, {
+        allow: [],
+        deny: []
+      });
     }
-  });
+
+    await channel.permissionOverwrites.edit(
+      guild.roles.everyone,
+      { SendMessages: false }
+    ).catch(() => {});
+  }
+
+  data.lockdown = true;
+  await data.save();
 }
 
 async function unlockServer(guild) {
-  guild.channels.cache.forEach(async channel => {
-    if (channel.type === ChannelType.GuildText) {
-      await channel.permissionOverwrites.edit(
-        guild.roles.everyone,
-        { SendMessages: null }
-      ).catch(() => {});
-    }
-  });
-  lockdownState.set(guild.id, false);
-}
+  const data = await getGuildData(guild.id);
+  if (!data.lockdown) return;
 
-/* =======================
-   SLASH HANDLER
-======================= */
+  for (const [channelId, perms] of data.lockdownBackup.entries()) {
+    const channel = guild.channels.cache.get(channelId);
+    if (!channel) continue;
+
+    await channel.permissionOverwrites.set([
+      {
+        id: guild.roles.everyone.id,
+        allow: perms.allow,
+        deny: perms.deny
+      }
+    ]).catch(() => {});
+  }
+
+  data.lockdownBackup.clear();
+  data.lockdown = false;
+  await data.save();
+}
 
 client.on('interactionCreate', async interaction => {
   if (!interaction.isChatInputCommand()) return;
   const guild = interaction.guild;
 
   if (interaction.commandName === 'help') {
-    const embed = new EmbedBuilder()
-      .setTitle('🛡 Security Bot')
-      .setColor('Red')
-      .setDescription('lel')
-      .addFields(
-        { name: '/lockdown', value: 'Lock server' },
-        { name: '/unlock', value: 'Unlock server' },
-        { name: '/status', value: 'Check status' },
-        { name: '/trust', value: 'Trust user' },
-        { name: '/untrust', value: 'Remove trust' }
-      );
-
-    return interaction.reply({ embeds: [embed], ephemeral: true });
+    return interaction.reply({
+      content: 'Security bot active.',
+      ephemeral: true
+    });
   }
 
   if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator))
     return interaction.reply({ content: 'Admin only.', ephemeral: true });
 
+  const data = await getGuildData(guild.id);
+
   if (interaction.commandName === 'lockdown') {
+    data.lockdown = true;
+    await data.save();
     await lockdownServer(guild);
-    lockdownState.set(guild.id, true);
     return interaction.reply('Server locked.');
   }
 
   if (interaction.commandName === 'unlock') {
+    data.lockdown = false;
+    await data.save();
     await unlockServer(guild);
     return interaction.reply('Server unlocked.');
   }
 
   if (interaction.commandName === 'status') {
     return interaction.reply(
-      `Lockdown: ${lockdownState.get(guild.id) ? 'ON' : 'OFF'}`
+      `Lockdown: ${data.lockdown ? 'ON' : 'OFF'}`
     );
   }
 
   if (interaction.commandName === 'trust') {
     const user = interaction.options.getUser('user');
-    if (!trustedUsers.has(guild.id))
-      trustedUsers.set(guild.id, new Set());
-    trustedUsers.get(guild.id).add(user.id);
+    if (!data.trustedUsers.includes(user.id)) {
+      data.trustedUsers.push(user.id);
+      await data.save();
+    }
     return interaction.reply(`${user.tag} trusted.`);
   }
 
   if (interaction.commandName === 'untrust') {
     const user = interaction.options.getUser('user');
-    trustedUsers.get(guild.id)?.delete(user.id);
+    data.trustedUsers =
+      data.trustedUsers.filter(id => id !== user.id);
+    await data.save();
     return interaction.reply(`${user.tag} removed.`);
   }
 });
