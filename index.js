@@ -218,7 +218,7 @@ async function unlockServer(guild) {
 async function emergencyLockdown(guild, reason) {
   await lockdownServer(guild);
   const log = getLog(guild);
-  if (log) log.send(`Emergency Lockdown: ${reason}`);
+  if (log) log.send(` Emergency Lockdown: ${reason}`);
 }
 
 client.on('guildMemberAdd', async member => {
@@ -324,43 +324,56 @@ client.on('channelDelete', async channel => {
 client.on('interactionCreate', async interaction => {
   if (!interaction.isChatInputCommand()) return;
 
-  const guild = interaction.guild;
-  const data = await getGuildData(guild.id);
+  try {
 
-  if (interaction.commandName === 'help')
-    return interaction.reply({ content: 'Security Bot Active.', ephemeral: true });
+    await interaction.deferReply({ ephemeral: true });
 
-  if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator))
-    return interaction.reply({ content: 'Admin only.', ephemeral: true });
+    const guild = interaction.guild;
+    const data = await getGuildData(guild.id);
 
-  if (interaction.commandName === 'lockdown') {
-    await lockdownServer(guild);
-    return interaction.reply('Server locked.');
-  }
-
-  if (interaction.commandName === 'unlock') {
-    await unlockServer(guild);
-    return interaction.reply('Server unlocked.');
-  }
-
-  if (interaction.commandName === 'status')
-    return interaction.reply(`Lockdown: ${data.lockdown ? 'ON' : 'OFF'}`);
-
-  if (interaction.commandName === 'trust') {
-    const user = interaction.options.getUser('user');
-    if (!data.trustedUsers.includes(user.id)) {
-      data.trustedUsers.push(user.id);
-      await data.save();
+    if (interaction.commandName === 'help') {
+      return interaction.editReply('Security Bot Active.');
     }
-    return interaction.reply(`${user.tag} trusted.`);
-  }
 
-  if (interaction.commandName === 'untrust') {
-    const user = interaction.options.getUser('user');
-    data.trustedUsers =
-      data.trustedUsers.filter(id => id !== user.id);
-    await data.save();
-    return interaction.reply(`${user.tag} removed.`);
+    if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+      return interaction.editReply('Admin only.');
+    }
+
+    if (interaction.commandName === 'lockdown') {
+      await lockdownServer(guild);
+      return interaction.editReply('Server locked.');
+    }
+
+    if (interaction.commandName === 'unlock') {
+      await unlockServer(guild);
+      return interaction.editReply('Server unlocked.');
+    }
+
+    if (interaction.commandName === 'status') {
+      return interaction.editReply(`Lockdown: ${data.lockdown ? 'ON' : 'OFF'}`);
+    }
+
+    if (interaction.commandName === 'trust') {
+      const user = interaction.options.getUser('user');
+      if (!data.trustedUsers.includes(user.id)) {
+        data.trustedUsers.push(user.id);
+        await data.save();
+      }
+      return interaction.editReply(`${user.tag} trusted.`);
+    }
+
+    if (interaction.commandName === 'untrust') {
+      const user = interaction.options.getUser('user');
+      data.trustedUsers = data.trustedUsers.filter(id => id !== user.id);
+      await data.save();
+      return interaction.editReply(`${user.tag} removed.`);
+    }
+
+  } catch (err) {
+    console.error(err);
+
+    if (!interaction.replied)
+      interaction.editReply('Error occurred.').catch(() => {});
   }
 });
 
