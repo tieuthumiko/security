@@ -324,61 +324,113 @@ client.on('channelDelete', async channel => {
 client.on('interactionCreate', async interaction => {
   if (!interaction.isChatInputCommand()) return;
 
+  if (interaction.replied || interaction.deferred) return;
+
+  try {
+    await interaction.deferReply({ ephemeral: true });
+  } catch (err) {
+    return; 
+  }
+
   try {
 
-    await interaction.deferReply({ ephemeral: true });
-
     const guild = interaction.guild;
-    const data = await getGuildData(guild.id);
 
-    if (interaction.commandName === 'help') {
+    const data = await getGuildData(guild.id).catch(() => null);
+    if (!data)
+      return interaction.editReply("Database not ready.");
+
+    switch (interaction.commandName) {
+
+      case 'help': {
+
+        const embed = {
+          color: 0x2b2d31,
+          title: "🛡 Advanced Security Control Panel",
+          description: "Enterprise-grade protection system.",
+          fields: [
+            {
+              name: "Lockdown",
+              value: "`/lockdown` `/unlock` `/status`"
+            },
+            {
+              name: "Trust System",
+              value: "`/trust` `/untrust`"
+            },
+            {
+              name: "System Info",
+              value:
+                `Lockdown: **${data.lockdown ? "Active" : "Disabled"}**\n` +
+                `Trusted Users: **${data.trustedUsers.length}**`
+            }
+          ],
+          footer: { text: "Security Engine v3" },
+          timestamp: new Date()
+        };
+
+        return interaction.editReply({ embeds: [embed] });
+      }
+
+      case 'lockdown':
+        await lockdownServer(guild);
+        return interaction.editReply("Server locked.");
+
+      case 'unlock':
+        await unlockServer(guild);
+        return interaction.editReply("Server unlocked.");
+
+      case 'status': {
+
+  const apiPing = Math.round(client.ws.ping);
+
+  const heartbeat = client.ws.ping < 0
+    ? "Reconnecting..."
+    : `${client.ws.ping}ms`;
+
+  const uptime = process.uptime();
+  const hours = Math.floor(uptime / 3600);
+  const minutes = Math.floor((uptime % 3600) / 60);
+  const seconds = Math.floor(uptime % 60);
+
+  const memory = (process.memoryUsage().rss / 1024 / 1024).toFixed(2);
 
   const embed = {
     color: 0x2b2d31,
-    author: {
-      name: `${guild.name} • Security System`,
-      icon_url: guild.iconURL()
-    },
-    title: "Advanced Security Control Panel",
-    description: "Enterprise-grade protection system for your server.\n\nUse the commands below to manage security.",
+    title: "Security System Status",
     fields: [
       {
-        name: "Lockdown Commands",
-        value:
-          "`/lockdown` → Lock entire server\n" +
-          "`/unlock` → Restore permissions\n" +
-          "`/status` → View security status",
-        inline: false
+        name: "API Ping",
+        value: `\`${apiPing}ms\``,
+        inline: true
       },
       {
-        name: "Trust Management",
-        value:
-          "`/trust @user` → Whitelist user\n" +
-          "`/untrust @user` → Remove whitelist",
-        inline: false
+        name: "Heartbeat",
+        value: `\`${heartbeat}\``,
+        inline: true
       },
       {
-        name: "Auto Protection",
-        value:
-          "• Anti Channel Create Spam\n" +
-          "• Anti Channel Delete\n" +
-          "• Anti Mass Join\n" +
-          "• Anti Invite Link\n" +
-          "• Anti Everyone Mention\n" +
-          "• Anti Spam Message\n" +
-          "• Global Cross-Server Ban",
-        inline: false
+        name: "Uptime",
+        value: `\`${hours}h ${minutes}m ${seconds}s\``,
+        inline: true
       },
       {
-        name: "System Info",
-        value:
-          `Lockdown: **${data.lockdown ? "Active" : "Disable"}**\n` +
-          `Trusted Users: **${data.trustedUsers.length}**`,
-        inline: false
+        name: "RAM Usage",
+        value: `\`${memory} MB\``,
+        inline: true
+      },
+      {
+        name: "Lockdown",
+        value: data.lockdown ? "Active" : "Disabled",
+        inline: true
+      },
+      {
+        name: "Trusted Users",
+        value: `\`${data.trustedUsers.length}\``,
+        inline: true
       }
     ],
     footer: {
-      text: "w miko"
+      text: `Shard: 0 • Node ${process.version}`
     },
     timestamp: new Date()
   };
@@ -386,45 +438,28 @@ client.on('interactionCreate', async interaction => {
   return interaction.editReply({ embeds: [embed] });
 }
 
-    if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
-      return interaction.editReply('Admin only.');
-    }
-
-    if (interaction.commandName === 'lockdown') {
-      await lockdownServer(guild);
-      return interaction.editReply('Server locked.');
-    }
-
-    if (interaction.commandName === 'unlock') {
-      await unlockServer(guild);
-      return interaction.editReply('Server unlocked.');
-    }
-
-    if (interaction.commandName === 'status') {
-      return interaction.editReply(`Lockdown: ${data.lockdown ? 'ON' : 'OFF'}`);
-    }
-
-    if (interaction.commandName === 'trust') {
-      const user = interaction.options.getUser('user');
-      if (!data.trustedUsers.includes(user.id)) {
-        data.trustedUsers.push(user.id);
-        await data.save();
+      case 'trust': {
+        const user = interaction.options.getUser('user');
+        if (!data.trustedUsers.includes(user.id)) {
+          data.trustedUsers.push(user.id);
+          await data.save();
+        }
+        return interaction.editReply(`${user.tag} trusted.`);
       }
-      return interaction.editReply(`${user.tag} trusted.`);
-    }
 
-    if (interaction.commandName === 'untrust') {
-      const user = interaction.options.getUser('user');
-      data.trustedUsers = data.trustedUsers.filter(id => id !== user.id);
-      await data.save();
-      return interaction.editReply(`${user.tag} removed.`);
+      case 'untrust': {
+        const user = interaction.options.getUser('user');
+        data.trustedUsers =
+          data.trustedUsers.filter(id => id !== user.id);
+        await data.save();
+        return interaction.editReply(`${user.tag} removed.`);
+      }
+
     }
 
   } catch (err) {
     console.error(err);
-
-    if (!interaction.replied)
-      interaction.editReply('Error occurred.').catch(() => {});
+    interaction.editReply("Internal error.").catch(() => {});
   }
 });
 
