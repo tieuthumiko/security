@@ -332,8 +332,59 @@ client.on('interactionCreate', async interaction => {
     const data = await getGuildData(guild.id);
 
     if (interaction.commandName === 'help') {
-      return interaction.editReply('Security Bot Active.');
-    }
+
+  const embed = {
+    color: 0x2b2d31,
+    author: {
+      name: `${guild.name} • Security System`,
+      icon_url: guild.iconURL()
+    },
+    title: "Advanced Security Control Panel",
+    description: "Enterprise-grade protection system for your server.\n\nUse the commands below to manage security.",
+    fields: [
+      {
+        name: "Lockdown Commands",
+        value:
+          "`/lockdown` → Lock entire server\n" +
+          "`/unlock` → Restore permissions\n" +
+          "`/status` → View security status",
+        inline: false
+      },
+      {
+        name: "Trust Management",
+        value:
+          "`/trust @user` → Whitelist user\n" +
+          "`/untrust @user` → Remove whitelist",
+        inline: false
+      },
+      {
+        name: "Auto Protection",
+        value:
+          "• Anti Channel Create Spam\n" +
+          "• Anti Channel Delete\n" +
+          "• Anti Mass Join\n" +
+          "• Anti Invite Link\n" +
+          "• Anti Everyone Mention\n" +
+          "• Anti Spam Message\n" +
+          "• Global Cross-Server Ban",
+        inline: false
+      },
+      {
+        name: "System Info",
+        value:
+          `Lockdown: **${data.lockdown ? "Active" : "Disable"}**\n` +
+          `Trusted Users: **${data.trustedUsers.length}**`,
+        inline: false
+      }
+    ],
+    footer: {
+      text: "w miko"
+    },
+    timestamp: new Date()
+  };
+
+  return interaction.editReply({ embeds: [embed] });
+}
 
     if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
       return interaction.editReply('Admin only.');
