@@ -364,7 +364,7 @@ client.on('interactionCreate', async interaction => {
                 `Trusted Users: **${data.trustedUsers.length}**`
             }
           ],
-          footer: { text: "Security Engine v3" },
+          footer: { text: "Security Engine" },
           timestamp: new Date()
         };
 
