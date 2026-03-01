@@ -1,0 +1,13 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Security Dashboard</title>
+</head>
+<body>
+  <% if (!user) { %>
+    <a href="/login">Login with Discord</a>
+  <% } else { %>
+    <a href="/dashboard">Go to Dashboard</a>
+  <% } %>
+</body>
+</html>

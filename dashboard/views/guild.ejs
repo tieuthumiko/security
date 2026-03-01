@@ -1,0 +1,19 @@
+<h2>Guild Settings</h2>
+
+<form method="POST" action="/api/update/<%= config.guildId %>">
+  Warn: <input name="warnThreshold" value="<%= config.warnThreshold %>" /><br>
+  RoleStrip: <input name="roleStripThreshold" value="<%= config.roleStripThreshold %>" /><br>
+  Kick: <input name="kickThreshold" value="<%= config.kickThreshold %>" /><br>
+  Ban: <input name="banThreshold" value="<%= config.banThreshold %>" /><br>
+  Lockdown: <input name="lockdownThreshold" value="<%= config.lockdownThreshold %>" /><br>
+  <button type="submit">Save</button>
+</form>
+
+<h3>Recent Threat Logs</h3>
+<ul>
+  <% logs.forEach(log => { %>
+    <li>
+      <%= log.userId %> - <%= log.punishment %> - <%= log.score %>
+    </li>
+  <% }) %>
+</ul>
