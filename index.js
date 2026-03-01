@@ -1,58 +1,670 @@
 require('dotenv').config();
-
-const { Client, GatewayIntentBits, Partials } = require('discord.js');
+const express = require('express');
 const mongoose = require('mongoose');
-const fs = require('fs');
-const path = require('path');
+const {
+  Client,
+  GatewayIntentBits,
+  PermissionsBitField,
+  ChannelType,
+  ActivityType,
+  REST,
+  Routes,
+  SlashCommandBuilder,
+  AuditLogEvent
+} = require('discord.js');
+
+const userThreatMap = new Map();
+
+function addThreat(guildId, userId, score) {
+  const key = `${guildId}-${userId}`;
+  const now = Date.now();
+
+  if (!userThreatMap.has(key)) {
+    userThreatMap.set(key, []);
+  }
+
+  userThreatMap.get(key).push({ score, time: now });
+
+  const recent = userThreatMap
+    .get(key)
+    .filter(t => now - t.time < 15000);
+
+  userThreatMap.set(key, recent);
+
+  const total = recent.reduce((a, b) => a + b.score, 0);
+
+  return total;
+}
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+app.get('/', (req, res) => res.send('Bot is running.'));
+app.listen(PORT, () => console.log(`Web running on ${PORT}`));
+
+mongoose.set('bufferCommands', false);
+
+mongoose.connect(process.env.MONGO_URI, {
+  serverSelectionTimeoutMS: 5000
+})
+.then(() => console.log('MongoDB Connected'))
+.catch(err => console.error('MongoDB Error:', err));
+
+mongoose.connection.on('disconnected', () => {
+  console.log('⚠ MongoDB Disconnected');
+});
+const guildSchema = new mongoose.Schema({
+  guildId: { type: String, unique: true },
+  trustedUsers: { type: [String], default: [] },
+  lockdown: { type: Boolean, default: false },
+  lockdownBackup: {
+  type: Map,
+  of: [
+    {
+      id: String,
+      type: String,
+      allow: [String],
+      deny: [String]
+    }
+  ],
+  default: {}
+}
+});
+
+const Guild = mongoose.model('Guild', guildSchema);
 
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.GuildBans,
     GatewayIntentBits.MessageContent
-  ],
-  partials: [Partials.Channel]
+  ]
 });
 
-mongoose.connect(process.env.MONGO_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true
-})
-.then(() => console.log("✅ MongoDB Connected"))
-.catch(err => console.error("❌ Mongo Error:", err));
+const TOKEN = process.env.TOKEN;
+const CLIENT_ID = process.env.CLIENT_ID;
 
-const modelsPath = path.join(__dirname, 'models');
-fs.readdirSync(modelsPath).forEach(file => {
-  if (file.endsWith('.js')) {
-    require(`./models/${file}`);
+const guildCache = new Map();
+const joinMap = new Map();
+const messageMap = new Map();
+const channelCreateMap = new Map();
+const channelDeleteMap = new Map();
+const globalActionMap = new Map();
+
+async function getGuildData(guildId) {
+  const cached = guildCache.get(guildId);
+  if (cached && Date.now() - cached.timestamp < 30000)
+    return cached.data;
+
+  let data = await Guild.findOne({ guildId }).catch(() => null);
+  if (!data) data = await Guild.create({ guildId });
+
+  guildCache.set(guildId, { data, timestamp: Date.now() });
+  return data;
+}
+
+async function isTrusted(member) {
+  if (member.permissions.has(PermissionsBitField.Flags.Administrator))
+    return true;
+
+  const data = await getGuildData(member.guild.id).catch(() => null);
+  if (!data) return false;
+  return data.trustedUsers.includes(member.id);
+}
+
+function trackAction(map, guildId, userId, time = 10000, limit = 3) {
+  const key = `${guildId}-${userId}`;
+  const now = Date.now();
+
+  if (!map.has(key)) map.set(key, []);
+  map.get(key).push(now);
+
+  const recent = map.get(key).filter(t => now - t < time);
+  map.set(key, recent);
+
+  return recent.length >= limit;
+}
+
+function trackGlobal(userId, action) {
+  const key = `${userId}-${action}`;
+  const now = Date.now();
+
+  if (!globalActionMap.has(key))
+    globalActionMap.set(key, []);
+
+  globalActionMap.get(key).push(now);
+
+  const recent = globalActionMap.get(key)
+    .filter(t => now - t < 60000);
+
+  globalActionMap.set(key, recent);
+
+  return recent.length >= 5;
+}
+
+async function getLog(guild) {
+
+  let category = guild.channels.cache.find(
+    c => c.name === '🛡 Security' && c.type === 4
+  );
+
+  if (!category) {
+    category = await guild.channels.create({
+      name: '🛡 Security',
+      type: 4,
+      position: 0,
+      permissionOverwrites: [
+        {
+          id: guild.roles.everyone.id,
+          deny: ['ViewChannel']
+        }
+      ]
+    }).catch(() => null);
+  }
+
+  let log = guild.channels.cache.find(
+    c => c.name === 'security-logs'
+  );
+
+  if (!log) {
+    log = await guild.channels.create({
+      name: 'security-logs',
+      type: 0,
+      parent: category?.id,
+      permissionOverwrites: [
+        {
+          id: guild.roles.everyone.id,
+          deny: ['ViewChannel']
+        }
+      ]
+    }).catch(() => null);
+  }
+
+  if (log && category && log.parentId !== category.id) {
+    await log.setParent(category.id).catch(() => {});
+  }
+
+  if (category) {
+    await category.setPosition(0).catch(() => {});
+  }
+
+  return log;
+}
+
+async function sendSecurityAlert(guild, data) {
+
+  const category = await ensureSecurityCategory(guild);
+
+  let logChannel = guild.channels.cache.find(
+    c => c.name === "security-logs"
+  );
+
+  if (!logChannel) {
+    logChannel = await guild.channels.create({
+      name: "security-logs",
+      type: 0,
+      parent: category.id
+    });
+  }
+
+  const embed = {
+    title: "🛡 Security Alert",
+    color: 0xff0000,
+    fields: [
+      { name: "Action", value: data.action, inline: true },
+      { name: "User", value: data.user, inline: true },
+      { name: "Threat Score", value: `${data.threat}%`, inline: true },
+      { name: "Time", value: `<t:${Math.floor(Date.now()/1000)}:F>` }
+    ],
+    footer: { text: "by miko" }
+  };
+
+  await logChannel.send({ embeds: [embed] }).catch(() => {});
+}
+async function globalBan(userId, sourceGuildId) {
+  client.guilds.cache.forEach(async g => {
+    if (g.id === sourceGuildId) return;
+    const m = await g.members.fetch(userId).catch(() => {});
+    if (m) await m.ban({ reason: 'Global Anti Nuke' }).catch(() => {});
+  });
+}
+
+client.once('ready', async () => {
+  console.log(`Logged in as ${client.user.tag}`);
+
+  client.user.setPresence({
+    activities: [{ name: '/help', type: ActivityType.Watching }],
+    status: 'online'
+  });
+
+  const commands = [
+    new SlashCommandBuilder().setName('help').setDescription('Show help'),
+    new SlashCommandBuilder().setName('lockdown').setDescription('Lock server'),
+    new SlashCommandBuilder().setName('unlock').setDescription('Unlock server'),
+    new SlashCommandBuilder().setName('status').setDescription('Check status'),
+    new SlashCommandBuilder()
+      .setName('trust')
+      .setDescription('Trust user')
+      .addUserOption(o => o.setName('user').setDescription('User').setRequired(true)),
+    new SlashCommandBuilder()
+      .setName('untrust')
+      .setDescription('Remove trusted user')
+      .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
+  ].map(c => c.toJSON());
+
+  const rest = new REST({ version: '10' }).setToken(TOKEN);
+  await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
+
+  console.log("Slash commands registered");
+});
+
+async function lockdownServer(guild) {
+  const data = await getGuildData(guild.id);
+  if (data.lockdown) return;
+
+  data.lockdownBackup.clear();
+
+  for (const channel of guild.channels.cache.values()) {
+
+    if (!channel.permissionOverwrites) continue;
+
+    const snapshot = [];
+
+    channel.permissionOverwrites.cache.forEach(overwrite => {
+      snapshot.push({
+        id: overwrite.id,
+        type: overwrite.type,
+        allow: overwrite.allow.toArray(),
+        deny: overwrite.deny.toArray()
+      });
+    });
+
+    data.lockdownBackup.set(channel.id, snapshot);
+
+    await channel.permissionOverwrites.edit(
+      guild.roles.everyone.id,
+      {
+        SendMessages: false,
+        Connect: false,
+        Speak: false,
+        CreatePublicThreads: false,
+        CreatePrivateThreads: false
+      }
+    ).catch(() => {});
+  }
+
+  data.lockdown = true;
+  await data.save();
+}
+
+async function unlockServer(guild) {
+  const data = await getGuildData(guild.id);
+  if (!data.lockdown) return;
+
+  for (const [channelId, snapshot] of data.lockdownBackup.entries()) {
+
+    const channel = guild.channels.cache.get(channelId);
+    if (!channel) continue;
+
+    await channel.permissionOverwrites.set([]).catch(() => {});
+
+    for (const overwrite of snapshot) {
+
+      await channel.permissionOverwrites.create(
+        overwrite.id,
+        {
+          allow: overwrite.allow,
+          deny: overwrite.deny
+        },
+        {
+          type: overwrite.type
+        }
+      ).catch(() => {});
+    }
+  }
+
+  data.lockdownBackup.clear();
+  data.lockdown = false;
+  await data.save();
+}
+
+async function emergencyLockdown(guild, reason) {
+  await lockdownServer(guild);
+  const log = getLog(guild);
+  if (log) log.send(` Emergency Lockdown: ${reason}`);
+}
+
+client.on('guildMemberAdd', async member => {
+  const guild = member.guild;
+  const now = Date.now();
+
+  if (!joinMap.has(guild.id)) joinMap.set(guild.id, []);
+  joinMap.get(guild.id).push(now);
+
+  const recent = joinMap.get(guild.id)
+    .filter(t => now - t < 10000);
+
+  if (recent.length >= 5) {
+    await emergencyLockdown(guild, 'Mass Join');
+    setTimeout(() => unlockServer(guild), 5 * 60 * 1000);
+  }
+
+  joinMap.set(guild.id, recent);
+});
+
+client.on('messageCreate', async message => {
+  if (!message.guild || message.author.bot) return;
+  if (await isTrusted(message.member)) return;
+
+  const now = Date.now();
+  if (!messageMap.has(message.author.id))
+    messageMap.set(message.author.id, []);
+
+  messageMap.get(message.author.id).push(now);
+
+  const recent = messageMap.get(message.author.id)
+    .filter(t => now - t < 5000);
+
+  if (recent.length >= 6) {
+    await message.delete().catch(() => {});
+    await message.member.timeout(600000).catch(() => {});
+  }
+
+  messageMap.set(message.author.id, recent);
+
+  if (message.mentions.everyone || message.mentions.users.size >= 5) {
+    await message.delete().catch(() => {});
+    await message.member.timeout(600000).catch(() => {});
+  }
+
+  if (/discord\.gg|discord\.com\/invite/.test(message.content)) {
+    await message.delete().catch(() => {});
   }
 });
 
-console.log("✅ Models Loaded");
+client.on('channelCreate', async channel => {
+  const guild = channel.guild;
+  await new Promise(r => setTimeout(r, 1000));
 
-const eventsPath = path.join(__dirname, 'events');
+  const logs = await guild.fetchAuditLogs({
+    type: AuditLogEvent.ChannelCreate,
+    limit: 1
+  }).catch(() => null);
 
-fs.readdirSync(eventsPath).forEach(file => {
+  if (!logs) return;
+  const entry = logs.entries.first();
+  if (!entry) return;
 
-  if (!file.endsWith('.js')) return;
+  const member = await guild.members.fetch(entry.executor.id).catch(() => {});
+  if (!member || await isTrusted(member)) return;
 
-  const event = require(`./events/${file}`);
-
-  if (file === "ready.js") {
-    client.once("ready", (...args) => event(client, ...args));
-  } else {
-    const eventName = file.replace('.js', '');
-    client.on(eventName, (...args) => event(client, ...args));
+  if (
+    trackAction(channelCreateMap, guild.id, member.id) ||
+    trackGlobal(member.id, 'create')
+  ) {
+    await member.ban({ reason: 'Channel Create Spam' }).catch(() => {});
+    await emergencyLockdown(guild, 'Channel Create Spam');
+    globalBan(member.id, guild.id);
   }
-
 });
 
-console.log("✅ Events Loaded");
+client.on('channelDelete', async (channel) => {
 
-require('./dashboard/server')(client);
+  if (!channel.guild) return;
 
-console.log("✅ Dashboard Loaded");
+  const logs = await channel.guild.fetchAuditLogs({
+    type: 12,
+    limit: 1
+  }).catch(() => null);
 
-client.login(process.env.TOKEN);
+  if (!logs) return;
+
+  const entry = logs.entries.first();
+  if (!entry) return;
+
+  const executor = await channel.guild.members
+    .fetch(entry.executor.id)
+    .catch(() => null);
+
+  if (!executor) return;
+
+  if (await isTrusted(executor)) return;
+
+  const threat = addThreat(channel.guild.id, executor.id, 60);
+
+  if (threat >= 80) {
+
+    await executor.ban({ reason: "Channel Nuke" }).catch(() => {});
+
+    await emergencyLockdown(channel.guild, "Channel Nuke Detected");
+
+    await sendSecurityAlert(channel.guild, {
+      action: "Channel Deleted",
+      user: executor.user.tag,
+      threat
+    });
+
+  }
+});
+
+client.on('guildMemberUpdate', async (oldMember, newMember) => {
+
+  const addedRoles = newMember.roles.cache.filter(r =>
+    !oldMember.roles.cache.has(r.id)
+  );
+
+  for (const role of addedRoles.values()) {
+
+    if (role.permissions.has("Administrator")) {
+
+      const logs = await newMember.guild.fetchAuditLogs({
+        type: 25,
+        limit: 1
+      }).catch(() => null);
+
+      if (!logs) return;
+
+      const entry = logs.entries.first();
+      if (!entry) return;
+
+      const executor = await newMember.guild.members
+        .fetch(entry.executor.id)
+        .catch(() => null);
+
+      if (!executor || await isTrusted(executor)) return;
+
+      const threat = addThreat(newMember.guild.id, executor.id, 90);
+
+      await executor.ban({
+        reason: "Permission Escalation"
+      }).catch(() => {});
+
+      await emergencyLockdown(newMember.guild, "Permission Escalation");
+
+      await sendSecurityAlert(newMember.guild, {
+        action: "Admin Role Escalation",
+        user: executor.user.tag,
+        threat
+      });
+    }
+  }
+});
+
+client.on('guildMemberAdd', async (member) => {
+
+  if (!member.user.bot) return;
+
+  const logs = await member.guild.fetchAuditLogs({
+    type: 28,
+    limit: 1
+  }).catch(() => null);
+
+  if (!logs) return;
+
+  const entry = logs.entries.first();
+  if (!entry) return;
+
+  const executor = await member.guild.members
+    .fetch(entry.executor.id)
+    .catch(() => null);
+
+  if (!executor || await isTrusted(executor)) return;
+
+  const threat = addThreat(member.guild.id, executor.id, 80);
+
+  await member.kick("Unauthorized Bot Add").catch(() => {});
+  await executor.ban({ reason: "Unauthorized Bot Add" }).catch(() => {});
+
+  await sendSecurityAlert(member.guild, {
+    action: "Unauthorized Bot Add",
+    user: executor.user.tag,
+    threat
+  });
+});
+
+client.on('interactionCreate', async interaction => {
+  if (!interaction.isChatInputCommand()) return;
+
+  if (interaction.replied || interaction.deferred) return;
+
+  try {
+    await interaction.deferReply({ ephemeral: true });
+  } catch (err) {
+    return; 
+  }
+
+  try {
+
+    const guild = interaction.guild;
+
+    const data = await getGuildData(guild.id).catch(() => null);
+    if (!data)
+      return interaction.editReply("Database not ready.");
+
+    switch (interaction.commandName) {
+
+      case 'help': {
+
+        const embed = {
+          color: 0x2b2d31,
+          title: "🛡 Advanced Security Control Panel",
+          description: "Enterprise-grade protection system.",
+          fields: [
+            {
+              name: "Lockdown",
+              value: "`/lockdown` `/unlock` `/status`"
+            },
+            {
+              name: "Trust System",
+              value: "`/trust` `/untrust`"
+            },
+            {
+              name: "System Info",
+              value:
+                `Lockdown: **${data.lockdown ? "Active" : "Disabled"}**\n` +
+                `Trusted Users: **${data.trustedUsers.length}**`
+            }
+          ],
+          footer: { text: "Security Engine" },
+          timestamp: new Date()
+        };
+
+        return interaction.editReply({ embeds: [embed] });
+      }
+
+      case 'lockdown':
+        await lockdownServer(guild);
+        return interaction.editReply("Server locked.");
+
+      case 'unlock':
+        await unlockServer(guild);
+        return interaction.editReply("Server unlocked.");
+
+      case 'status': {
+
+  const apiPing = Math.round(client.ws.ping);
+
+  const heartbeat = client.ws.ping < 0
+    ? "Reconnecting..."
+    : `${client.ws.ping}ms`;
+
+  const uptime = process.uptime();
+  const hours = Math.floor(uptime / 3600);
+  const minutes = Math.floor((uptime % 3600) / 60);
+  const seconds = Math.floor(uptime % 60);
+
+  const memory = (process.memoryUsage().rss / 1024 / 1024).toFixed(2);
+
+  const embed = {
+    color: 0x2b2d31,
+    title: "Security System Status",
+    fields: [
+      {
+        name: "API Ping",
+        value: `\`${apiPing}ms\``,
+        inline: true
+      },
+      {
+        name: "Heartbeat",
+        value: `\`${heartbeat}\``,
+        inline: true
+      },
+      {
+        name: "Uptime",
+        value: `\`${hours}h ${minutes}m ${seconds}s\``,
+        inline: true
+      },
+      {
+        name: "RAM Usage",
+        value: `\`${memory} MB\``,
+        inline: true
+      },
+      {
+        name: "Lockdown",
+        value: data.lockdown ? "Active" : "Disabled",
+        inline: true
+      },
+      {
+        name: "Trusted Users",
+        value: `\`${data.trustedUsers.length}\``,
+        inline: true
+      }
+    ],
+    footer: {
+      text: `Shard: 0 • Node ${process.version}`
+    },
+    timestamp: new Date()
+  };
+
+  return interaction.editReply({ embeds: [embed] });
+}
+
+      case 'trust': {
+        const user = interaction.options.getUser('user');
+        if (!data.trustedUsers.includes(user.id)) {
+          data.trustedUsers.push(user.id);
+          await data.save();
+        }
+        return interaction.editReply(`${user.tag} trusted.`);
+      }
+
+      case 'untrust': {
+        const user = interaction.options.getUser('user');
+        data.trustedUsers =
+          data.trustedUsers.filter(id => id !== user.id);
+        await data.save();
+        return interaction.editReply(`${user.tag} removed.`);
+      }
+
+    }
+
+  } catch (err) {
+    console.error(err);
+    interaction.editReply("Internal error.").catch(() => {});
+  }
+});
+
+process.on('unhandledRejection', console.error);
+process.on('uncaughtException', console.error);
+
+client.login(TOKEN);
