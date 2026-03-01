@@ -34,13 +34,17 @@ const guildSchema = new mongoose.Schema({
   trustedUsers: { type: [String], default: [] },
   lockdown: { type: Boolean, default: false },
   lockdownBackup: {
-    type: Map,
-    of: {
+  type: Map,
+  of: [
+    {
+      id: String,
+      type: String,
       allow: [String],
       deny: [String]
-    },
-    default: {}
-  }
+    }
+  ],
+  default: {}
+}
 });
 
 const Guild = mongoose.model('Guild', guildSchema);
@@ -115,8 +119,112 @@ function trackGlobal(userId, action) {
   return recent.length >= 5;
 }
 
-function getLog(guild) {
-  return guild.channels.cache.find(c => c.name === 'security-logs');
+async function getLog(guild) {
+
+  let category = guild.channels.cache.find(
+    c => c.name === '🛡 Security' && c.type === 4
+  );
+
+  if (!category) {
+    category = await guild.channels.create({
+      name: '🛡 Security',
+      type: 4,
+      position: 0,
+      permissionOverwrites: [
+        {
+          id: guild.roles.everyone.id,
+          deny: ['ViewChannel']
+        }
+      ]
+    }).catch(() => null);
+  }
+
+  let log = guild.channels.cache.find(
+    c => c.name === 'security-logs'
+  );
+
+  if (!log) {
+    log = await guild.channels.create({
+      name: 'security-logs',
+      type: 0,
+      parent: category?.id,
+      permissionOverwrites: [
+        {
+          id: guild.roles.everyone.id,
+          deny: ['ViewChannel']
+        }
+      ]
+    }).catch(() => null);
+  }
+
+  if (log && category && log.parentId !== category.id) {
+    await log.setParent(category.id).catch(() => {});
+  }
+
+  if (category) {
+    await category.setPosition(0).catch(() => {});
+  }
+
+  return log;
+}
+
+async function sendSecurityAlert(guild, reason, executorId = null) {
+
+  const log = await getLog(guild);
+  if (!log) return;
+
+  const threatMap = {
+    "Mass Join": "HIGH",
+    "Channel Create Spam": "CRITICAL",
+    "Channel Delete Spam": "CRITICAL",
+    "Role Delete Spam": "CRITICAL",
+    "Mass Ban": "CRITICAL",
+    "Unknown": "MEDIUM"
+  };
+
+  const threatLevel = threatMap[reason] || "MEDIUM";
+
+  const embed = {
+    color: 0xff0000,
+    title: "SECURITY ALERT TRIGGERED",
+    description: "Automated protection system activated.",
+    fields: [
+      {
+        name: "Threat Detected",
+        value: `\`${reason}\``,
+        inline: true
+      },
+      {
+        name: "Threat Level",
+        value: threatLevel,
+        inline: true
+      },
+      {
+        name: "Executor",
+        value: executorId ? `<@${executorId}>` : "Unknown",
+        inline: true
+      },
+      {
+        name: "Action Taken",
+        value:
+          "• Emergency Lockdown\n" +
+          "• Permission Snapshot Saved\n" +
+          "• Global Ban Sync\n" +
+          "• Security Logging Enabled",
+        inline: false
+      },
+      {
+        name: "Timestamp",
+        value: `<t:${Math.floor(Date.now() / 1000)}:F>`,
+        inline: false
+      }
+    ],
+    footer: {
+      text: `Security Engine • ${guild.name}`
+    }
+  };
+
+  await log.send({ embeds: [embed] }).catch(() => {});
 }
 
 async function globalBan(userId, sourceGuildId) {
@@ -164,21 +272,23 @@ async function lockdownServer(guild) {
 
   for (const channel of guild.channels.cache.values()) {
 
-    const overwrite = channel.permissionOverwrites.cache.get(
-      guild.roles.everyone.id
-    );
+    if (!channel.permissionOverwrites) continue;
 
-    if (overwrite) {
-      data.lockdownBackup.set(channel.id, {
+    const snapshot = [];
+
+    channel.permissionOverwrites.cache.forEach(overwrite => {
+      snapshot.push({
+        id: overwrite.id,
+        type: overwrite.type,
         allow: overwrite.allow.toArray(),
         deny: overwrite.deny.toArray()
       });
-    } else {
-      data.lockdownBackup.set(channel.id, { allow: [], deny: [] });
-    }
+    });
+
+    data.lockdownBackup.set(channel.id, snapshot);
 
     await channel.permissionOverwrites.edit(
-      guild.roles.everyone,
+      guild.roles.everyone.id,
       {
         SendMessages: false,
         Connect: false,
@@ -197,17 +307,26 @@ async function unlockServer(guild) {
   const data = await getGuildData(guild.id);
   if (!data.lockdown) return;
 
-  for (const [channelId, perms] of data.lockdownBackup.entries()) {
+  for (const [channelId, snapshot] of data.lockdownBackup.entries()) {
+
     const channel = guild.channels.cache.get(channelId);
     if (!channel) continue;
 
-    await channel.permissionOverwrites.set([
-      {
-        id: guild.roles.everyone.id,
-        allow: perms.allow,
-        deny: perms.deny
-      }
-    ]).catch(() => {});
+    await channel.permissionOverwrites.set([]).catch(() => {});
+
+    for (const overwrite of snapshot) {
+
+      await channel.permissionOverwrites.create(
+        overwrite.id,
+        {
+          allow: overwrite.allow,
+          deny: overwrite.deny
+        },
+        {
+          type: overwrite.type
+        }
+      ).catch(() => {});
+    }
   }
 
   data.lockdownBackup.clear();
