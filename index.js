@@ -65,28 +65,14 @@ mongoose.connect(process.env.MONGO_URI, {
 mongoose.connection.on('disconnected', () => {
   console.log('⚠ MongoDB Disconnected');
 });
-const guildSchema = new mongoose.Schema({
-  guildId: { type: String, unique: true },
-  trustedUsers: { type: [String], default: [] },
-  lockdown: { type: Boolean, default: false },
-  lockdownBackup: {
-  type: Map,
-  of: [
-    {
-      id: String,
-      type: String,
-      allow: [String],
-      deny: [String]
-    }
-  ],
-  default: {}
-}
-});
 
 const backupSchema = new mongoose.Schema({
+
   guildId: { type: String, unique: true },
+
   name: String,
   icon: String,
+
   roles: [
     {
       id: String,
@@ -97,27 +83,34 @@ const backupSchema = new mongoose.Schema({
       position: Number
     }
   ],
+
   channels: [
-  { 
-    id: String,
-    name: String,
-    type: Number,
-    parent: String,
-    position: Number,
-    topic: String,
-    nsfw: Boolean,
-    rateLimitPerUser: Number,
-    bitrate: Number,
-    userLimit: Number,
-    permissionOverwrites: [
-      {
-        id: String,
-        allow: String,
-        deny: String
-      }
-    ]
+    {
+      id: String,
+      name: String,
+      type: Number,
+      parent: String,
+      position: Number,
+      topic: String,
+      nsfw: Boolean,
+      rateLimitPerUser: Number,
+      bitrate: Number,
+      userLimit: Number,
+      permissionOverwrites: [
+        {
+          id: String,
+          allow: String,
+          deny: String
+        }
+      ]
+    }
+  ],
+
+  createdAt: {
+    type: Date,
+    default: Date.now
   }
-]
+
 });
 
 const Backup = mongoose.model("Backup", backupSchema);
@@ -201,6 +194,27 @@ setInterval(() => {
 }, 60000);
 
 const permissionSnapshot = new Map();
+const auditCache = new Map();
+
+function preventDuplicateAudit(guildId, executorId, targetId) {
+
+  const key = `${guildId}-${executorId}-${targetId}`;
+  const now = Date.now();
+
+  if (auditCache.has(key)) {
+
+    const last = auditCache.get(key);
+
+    if (now - last < 5000) {
+      return true;
+    }
+
+  }
+
+  auditCache.set(key, now);
+  return false;
+
+}Z
 
 async function getGuildData(guildId) {
   const cached = guildCache.get(guildId);
