@@ -66,6 +66,36 @@ mongoose.connection.on('disconnected', () => {
   console.log('⚠ MongoDB Disconnected');
 });
 
+const guildSchema = new mongoose.Schema({
+  guildId: { type: String, unique: true },
+
+  trustedUsers: {
+    type: [String],
+    default: []
+  },
+
+  lockdown: {
+    type: Boolean,
+    default: false
+  },
+
+  lockdownBackup: {
+    type: Map,
+    of: [
+      {
+        id: String,
+        type: String,
+        allow: [String],
+        deny: [String]
+      }
+    ],
+    default: {}
+  }
+
+});
+
+const Guild = mongoose.model("Guild", guildSchema);
+
 const backupSchema = new mongoose.Schema({
 
   guildId: { type: String, unique: true },
@@ -122,8 +152,6 @@ const globalThreatSchema = new mongoose.Schema({
 });
 
 const GlobalThreat = mongoose.model("GlobalThreat", globalThreatSchema);
-
-const Guild = mongoose.model('Guild', guildSchema);
 
 const client = new Client({
   intents: [
